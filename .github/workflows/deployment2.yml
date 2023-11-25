@@ -17,6 +17,7 @@ jobs:
             npm init @eslint/config
             npm run lint
     test:
+      needs: lint
       runs-on: ubuntu_latest
       steps:
         - name: Get code
@@ -30,17 +31,18 @@ jobs:
         - name: Test code
           run: npm test
     deploy:
-        runs-on: ubuntu_latest-latest
-        steps:
-            - name: Get code
-              uses: actions/checkout@v3
-            - name: Install NodeJS
-              uses: actions/setup-node@v3
-              with:
-                node-version: 18
-            - name: Install dependencies
-              run: npm ci
-            - name: Builde code
-              run: npm run build
-            - name: Deploy code
-              run: echo "Deploying..."
+      needs: test
+      runs-on: ubuntu_latest-latest
+      steps:
+          - name: Get code
+            uses: actions/checkout@v3
+          - name: Install NodeJS
+            uses: actions/setup-node@v3
+            with:
+              node-version: 18
+          - name: Install dependencies
+            run: npm ci
+          - name: Builde code
+            run: npm run build
+          - name: Deploy code
+            run: echo "Deploying..."
