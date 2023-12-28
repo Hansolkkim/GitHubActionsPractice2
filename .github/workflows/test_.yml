@@ -1,0 +1,178 @@
+name: 3) Create release merge PR
+
+on: 
+  workflow_dispatch:
+    inputs:
+      targetBranchName:
+        description: "Target Branch Name"
+        required: true
+        default: "release/"
+        type: string
+      intoBranchName:
+        description: "Into"
+        required: true
+        default: "develop"
+        type: choice
+        options:
+          - develop
+          - master
+
+jobs:
+  Setup:
+    runs-on: [self-hosted, iOS]
+
+    steps:
+      - name: Check Exist Release Branch
+        id: releaseBranch
+        run: |
+            export TARGET_BRANCH_NAME='${{ inputs.targetBranchName }}'
+            if [ -n "$TARGET_BRANCH_NAME" ]; then
+              git remote update origin
+            else
+              TAGET_BRANCH_NAME=$(git remote show origin | grep -oE 'release\/\d.\d+.\d+' | sort -V | uniq | tail -1)
+            fi
+
+            echo "name=$TARGET_BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Check Exist Into Branch
+        id: intoBranch
+        run: |
+            export INTO_BRANCH_NAME='${{ inputs.intoBranchName }}'
+            if [ -n "$INTO_BRANCH_NAME" ]; then
+              git remote update origin
+            else
+              TARGET_BRANCH_NAME=$(git remote show origin | grep -q '${{ inputs.intoBranchName }}' )
+            fi
+
+            echo "name=$INTO_BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Checkout the into branch
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ steps.intoBranch.outputs.name }}
+          fetch-depth: 0
+
+      - name: Check no commits between the release branch and the into branch
+        run: |
+          export LAST_COMMIT_HASH=$(git rev-parse origin/${{ steps.releaseBranch.outputs.name }}) 
+          export CONTAINED_BRANCH_NAMES=$(git branch -a --contain $LAST_COMMIT_HASH)
+
+          if [[ $CONTAINED_BRANCH_NAMES =~ "remotes/origin/${{ steps.intoBranch.outputs.name }}" ]]; then
+            exit 1
+          fi
+
+      - name: Create new merge branch
+        id: mergeBranch
+        run: |
+          export RELEASE_VERSION=$(echo ${{ steps.releaseBranch.outputs.name }} | grep -oE "\d+.\d+.\d+" )
+          export MERGE_BRANCH_NAME="merge/$RELEASE_VERSION"
+
+          git checkout -f -B $MERGE_BRANCH_NAME
+          git pull origin ${{ steps.releaseBranch.outputs.name }} --no-rebase --allow-unrelated-histories || true
+
+          IFS=$'\n'
+          export CONFLICT_FILE_NAMES=($(git ls-files -u | cut -f2 | uniq))
+
+          export CONFLICT_FILE_COUNT=${#CONFLICT_FILE_NAMES[@]}
+          echo "conflictFileCount=#CONFLICT_FILE_COUNT" >> $GITHUB_OTUPUT
+
+          if [ $CONFLICT_FILE_COUNT -gt 0 ]; then
+          export CONFLICT_FILE_MESSAGES=""
+          for CONFLICT_FILE_NAME in ${CONFLICT_FILE_NAMES[@]}; do
+              export CONFLICT_FILE_LOG_FORMAT="format:$CONFLICT_FILE_NAME: <@%an>"
+              export CONFLICT_FILE_LOG=$(git log -n 1 --pretty=$CONFLICT_FILE_LOG_FORMAT $CONFLICT_FILE_NAME)
+              CONFLICT_FILE_MESSAGES+="$CONFLICT_FILE_LOG\n"
+          done
+          echo "conflict_file_messages=$CONFLICT_FILE_MESSAGES" >> $GITHUB_OUTPUT
+          
+          git add --all
+          git commit --no-edit
+          fi
+
+          git push origin $MERGE_BRANCH_NAME || true
+          echo "name=$MERGE_BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create an merge P.R
+        id: createPR
+        run: |
+          export RELEASE_VERSION=$(echo ${{ steps.releaseBranch.outputs.name }} | grep -oE "\d+.\d+.\d+" )
+          export PR_TITLE="Release/$RELEASE_VERSION into ${{ steps.intoBranch.outputs.name }}"
+          echo "title=$PR_TITLE" >> $GITHUB_OUTPUT
+
+          export CREATE_PR_REQUEST_JSON='
+            {
+              "title": "'$PR_TITLE'",
+              "body": "릴리스 브랜치를 ${{ steps.intoBranch.outputs.name }} 브랜치로 머지하는 PR입니다.",
+              "head": "${{ steps.mergeBranch.outputs.name }}",
+              "base": "${{ steps.intoBranch.outputs.name }}"
+            }
+          '
+
+          export CREATE_PR_RESPONSE_JSON\$(
+            curl \
+              -s \
+              -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token ${{ secrets.GRIP_CI_BOT_GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ github.repository }}/pulls \
+              -d "$CREATE_PR_REQUEST_JSON" \
+            | tr -d '\n'
+          )
+
+          echo "responseJSON=$CREATE_PR_RESPONSE_JSON" >> $GITHUB_OUTPUT
+
+      - name: Merge merge P.R
+        id: mergePR
+        run: |
+          export CREATE_PR_RESPONSE_JSON='${{ steps.createPR.outputs.responseJSON }}'
+          export HAS_ERRORS=$(echo $CREATE_PR_RESPONSE_JSON | jq 'has("errors")')
+          export CONFLICT_FILE_COUNT=${{ steps.mergeBranch.outputs.conflictFileCount }}
+          export PR_TITLE="${{ steps.createPR.outputs.title }}"
+
+          if [ $HAS_ERRORS = "true" ]; then
+            export CREATE_PR_ERROR_MESSAGES=$(echo $CREATE_PR_RESPONSE_JSON | jq -r ".errors[].message")
+            export RESULT_HEADER="*[Auto Merger] Fail to merge* :boom:"
+            export RESULT_MESSAGE="$RESULT_HEADER\n\n$PR_TITLE\n$CREATE_PR_ERROR_MESSAGES"
+            export RESULT_COLOR="danger"
+            
+          elif [ $CONFLICT_FILE_COUNT -eq 0 ]; then
+            export PR_HTML_URL=$(echo $CREATE_PR_RESPONSE_JSON | jq -r ".html_url")
+            export PR_NUMBER=$(echo $CREATE_PR_RESPONSE_JSON | jq -r ".number")
+            export MERGE_PR_RESPONSE_JSON=$(
+              curl \
+                -s \
+                -X PUT \
+                -H "Accpet: application/vnd.github.v3+json" \
+                -H "Authorization: token ${{ secrets.GRIP_CI_BOT_GITHUB_TOKEN }}" \
+                https://api.github.com/repos/${{ github.repository }}/pulls/"$PR_NUMBER"/merge
+            )
+            export MERGE_PR_MESSAGE=$(echo $MERGE_PR_RESPONSE_JSON | jq -r ".message")
+            export RESULT_HEADER="*[Auto Merger] Success to auto merge* :pr-merged:"
+            export RESULT_MESSAGE="$RESULT_HEADER\n\n$PR_TITLE\n$MERGE_PR_MESSAGE\n$PR_HTML_URL"
+            export RESULT_COLOR="good"
+
+            git tag -a "$(echo ${{ steps.releaseBranch.outputs.name }} | grep -oE "\d+.\d+.\d+" )" -m " "
+
+          else
+            export PR_HTML_URL=$(echo $MERGE_PR_RESPONSE_JSON | jq -r ".message")
+            export RESULT_HEADER="*[Auto Merger] Fail to auto merge* :boom:"
+            export CONFLICT_MESSAGE="Pull Request has conflicts"
+            export CONFLICT_FILE_MESSAGES="${{ steps.mergeBranch.outputs.conflict_file_messages }}"
+            export RESULT_MESSAGE="$RESULT_HEADER\n\n$PR_TITLE\n$CONFLICT_MESSAGE\n\n$CONFLICT_FILE_MESSAGES\n$PR_HTML_URL"
+            export RESULT_COLOR="danger"
+
+            export PR_COMMENT_BODY="$CONFLICT_FILE_MESSAGES\nPTAL above conflict files."
+            export PR_COMMENT_REQUEST_JSON='{ "body": "'$PR_COMMENT_BODY'" }'
+            export PR_NUMBER=$(echo $CREATE_PR_RESPONSE_JSON | jq -r ".number")
+
+            curl \
+              -s \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: token ${{ secrets.GRIP_CI_BOT_GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ github.repository }}/issues/"$PR_NUMBER"/comments \
+              -d "$PR_COMMENT_REQUEST_JSON"
+          fi
+
+          echo "resultMessage=$RESULT_MESSAGE" >> $GITHUB_OUTPUT
+          echo "resultColor=$RESULT_COLOR" >> $GITHUB_OUTPUT
